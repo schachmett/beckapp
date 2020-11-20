@@ -1,0 +1,11 @@
+[Unit]
+Description=Start backup script that uses borg and rsync to back up everything according to its backup.yaml 
+
+[Service]
+Type=simple
+Nice=19
+IOSchedulingClass=2
+IOSchedulingPriority=7
+ExecStart=/usr/local/bin/beckapp backup
+User=root
+Group=root

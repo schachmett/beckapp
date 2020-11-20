@@ -1,0 +1,10 @@
+[Unit]
+Description=Timer for backup script that uses borg and rsync to back up everything according to its backup.yaml 
+
+[Timer]
+WakeSystem=false
+OnCalendar=*:0/30
+RandomizedDelaySec=30
+
+[Install]
+WantedBy=timers.target

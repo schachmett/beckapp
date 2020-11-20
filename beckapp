@@ -1,0 +1,728 @@
+#!/usr/bin/env python3
+"""
+beckapp automates rsync and borg backup jobs.
+"""
+# pylint: disable=invalid-name
+# pylint: disable=missing-docstring
+
+import sys
+import socket
+import traceback
+import os
+import copy
+from pathlib import Path
+import subprocess
+import shlex
+import pwd
+import argparse
+from datetime import datetime, timedelta
+import logging
+import logging.handlers
+from collections.abc import Mapping, Iterable
+
+import yaml
+
+__appname__ = "beckapp"
+CONFIG = Path("/usr/local/etc/backup/backup.yaml")
+
+
+def main(already_running=False):
+    err_code = 0
+    defaults, config = load_config(CONFIG)
+    params = parse_args()
+    if params.log_path is None:
+        params.log_path = defaults["log"]["path"]
+    setup_logging(params.log_path, verbose=params.verbose)
+    main_log(f"Called beckapp.py with arguments {params}", logging.DEBUG)
+
+    job_names = params.job or tuple(config.keys())
+    jobs = []
+    for job_name in job_names:
+        try:
+            job = Job.load(job_name, config[job_name])
+            jobs.append(job)
+            if params.verbose:
+                main_log(f"'{job}' config: {config}", logging.DEBUG)
+        except ValueError:
+            main_log(f"Error loading job '{job_name}', skipping that...", logging.ERROR)
+            err_code = 1
+        except KeyError:
+            main_log(f"Found no config for job '{job_name}', skipping that...", logging.ERROR)
+            err_code = 1
+
+    ex = Executor(params, jobs, already_running=already_running)
+    return ex(params.command[0]) + err_code
+
+
+class Executor:
+    def __init__(self, params, jobs, already_running=False):
+        self.jobs = jobs
+        self.params = params
+        self.already_running = already_running
+
+    def __call__(self, command):
+        commands = {
+            "backup": self.backup,
+            "schedule": self.schedule,
+            "showlog": self.showlog,
+            "mount": self.mount,
+            "status": self.status,
+            "debug": self.debug,
+        }
+        return commands[command]()
+
+    def backup(self):
+        if self.already_running:
+            main_log("Stopping: Backup already in progress", logging.CRITICAL)
+            return 2
+        for job in self.jobs:
+            job.start(force=self.params.force_backup)
+        return 0
+
+    def schedule(self):
+        for job in self.jobs:
+            job.todo = True
+        return 0
+
+    def mount(self):
+        if len(self.jobs) != 1:
+            main_log("Mount needs exactly 1 'job' argument", logging.CRITICAL)
+            return 2
+        self.jobs[0].mount()
+        return 0
+
+    def showlog(self):
+        if not self.params.job:
+            run_less(Path(self.params.log_path) / f"{__appname__}.log",
+                     follow=self.params.watch_log)
+            return 0
+        if len(self.jobs) == 1:
+            self.jobs[0].show_log(self.params.log_number, follow=self.params.watch_log)
+            return 0
+        main_log("Showlog takes only 0 or 1 'job' arguments", logging.CRITICAL)
+        return 2
+
+    @staticmethod
+    def service_status():
+        main_log("-" * 22 + " service status " + "-" * 22)
+        _, out, _ = run(f"/bin/systemctl --no-pager -n20 -l status {__appname__}")
+        main_log(out.strip())
+        main_log("-" * 22 + "  timer status  " + "-" * 22)
+        _, out, _ = run(f"/bin/systemctl list-timers")
+        out = "\n".join([line for line in out.split("\n")
+                         if __appname__ in line or "NEXT" in line])
+        main_log(out.strip())
+
+    def status(self):
+        blue = "\033[94m"
+        endcolor = "\033[0m"
+        self.service_status()
+        main_log("-" * 60)
+        main_log(f"{'Job Name':^20s}{'Age':^20s}{'Due?':^20s}")
+        main_log("-" * 60)
+        for job in self.jobs:
+            if job.due:
+                color = "\033[91m"  # red
+            else:
+                color = "\033[92m"  # green
+            if job.age > job.interval:
+                due = "  EXPIRED"
+            elif job.due:
+                due = "  SCHEDULED"
+            else:
+                due = "  FINE"
+            if job.interval != timedelta.max:
+                due += f" ({job.age/job.interval*100:.0f} %)"
+            # due = str(job.interval)
+            main_log(f" {job.name:<19s}"
+                     f"{blue}{str(job.age):>20s}{endcolor}"
+                     f"{color}{due:>20s}{endcolor}")
+        main_log("-" * 60)
+        if self.already_running:
+            main_log(f"\033[91m{'A backup is running at the moment!':^60s}{endcolor}")
+            main_log("-" * 60)
+        return 0
+
+    @staticmethod
+    def debug():
+        import time
+        time.sleep(20)
+        return 0
+
+
+
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(description="Do borg and rsync backups")
+    commands = ("backup", "schedule", "showlog", "mount", "status", "debug")
+    parser.add_argument("command", nargs=1, choices=commands)
+    parser.add_argument("-j", "--job", nargs="+")
+    parser.add_argument("-w", "--watch-log", action="store_true")
+    parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument("-l", "--log-number", nargs=1, type=int, default=None)
+    parser.add_argument("-y", "--confirm-yes", action="store_true")
+    parser.add_argument("-f", "--force-backup", action="store_true")
+    parser.add_argument("--ignore-pre", action="store_true")
+    parser.add_argument("--log-path", nargs=1, type=str, default=None)
+    params = parser.parse_args()
+    return params
+
+
+def load_config(config_path):
+    if not Path(config_path).is_file():
+        raise RuntimeError(f"Did not find configuration file '{config_path}'!")
+    with open(config_path, "r") as cf:
+        raw_config = yaml.safe_load(cf)
+    defaults = raw_config["default"]
+    config = {}
+    def update(d, u):
+        for k, v in u.items():
+            if isinstance(v, Mapping):
+                d[k] = update(d.get(k, {}), v)
+            else:
+                d[k] = v
+        return d
+    for key, jobdict in raw_config.items():
+        if key == "default":
+            continue
+        config[key] = update(copy.deepcopy(defaults), jobdict)
+    return defaults, config
+
+
+def setup_logging(logpath, verbose=False):
+    main_logger = _create_main_logger(Path(logpath) / f"{__appname__}.log", verbose=verbose)
+    def log_uncaught(exctype, value, tb):
+        tbstring = "".join(traceback.format_tb(tb))
+        tbstring = tbstring.replace("\n", "\n\t")
+        main_logger.exception(f"Traceback (most recent call last):\n"
+                              f"\t{tbstring}{exctype.__name__}: {value}")
+        sys.__excepthook__(exctype, value, tb)
+    sys.excepthook = log_uncaught
+
+class GroupWriteRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """Rotating log files are created with umask 000 so that everyone can read and write
+    to them. This circumvents issues when invoking this script as different users.
+    """
+    def _open(self):
+        prevumask = os.umask(0o000)
+        #os.fdopen(os.open('/path/to/file', os.O_WRONLY, 0600))
+        rtv = super()._open()
+        os.umask(prevumask)
+        return rtv
+
+def _create_main_logger(logfile, verbose=False):
+    if verbose:
+        level = logging.DEBUG
+    else:
+        level = logging.INFO
+    handler = GroupWriteRotatingFileHandler(logfile, maxBytes=5*1024*1024, backupCount=9)
+    formatter = logging.Formatter("%(asctime)s [%(levelname)-5.5s]: %(message)s")
+    handler.setFormatter(formatter)
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.setLevel(level)
+    if verbose:
+        stdout_handler.setFormatter(formatter)
+    logger = logging.getLogger(f"{__appname__}")
+    logger.setLevel(logging.DEBUG)
+    logger.addHandler(handler)
+    logger.addHandler(stdout_handler)
+    return logger
+
+def main_log(msg, level=logging.INFO):
+    logging.getLogger(f"{__appname__}").log(level, msg)
+
+def main_log_raise(exc, msg):
+    logging.getLogger(f"{__appname__}").debug(msg)
+    raise exc(msg)
+
+
+class Job:
+    _default_info = {"last_success_time": 0, "last_result": False, "is_due": True}
+    config_requires = ("source", "target", "command", "log")
+    command_config_requires = ("command", "interval", "user")
+    def __init__(self, name, config):
+        self.name = name
+        self._config = config
+        self._init_info()
+        self._init_logger()
+        self.log(f"Created job '{self.name}'", logging.DEBUG)
+
+    @staticmethod
+    def load(name, config, ignore_pre=False):     # pylint: disable=inconsistent-return-statements
+        if ignore_pre:
+            config.pop("pre-commands")
+        try:
+            command = config["command"]["command"]
+            if command == "borg":
+                assert all(k in config for k in BorgJob.config_requires)
+                assert all(k in config["command"] for k in BorgJob.command_config_requires)
+                return BorgJob(name, config)
+            elif command == "rsync":
+                assert all(k in config for k in RSyncJob.config_requires)
+                assert all(k in config["command"] for k in RSyncJob.command_config_requires)
+                return RSyncJob(name, config)
+            else:
+                raise ValueError(f"Unknown job command {config['command']}")
+        except (AssertionError, KeyError, TypeError, ValueError):
+            main_log_raise(ValueError, f"job '{name}': ill-defined config '{config}'")
+
+    def start(self, force=False):
+        if not self.due and not force:
+            self.log(f"Job {self.name} is not due, skipping...")
+            return
+        if not self.todo:       # if this is not due manually
+            self._rotate_log()
+        self.log(f"Job {self.name} is due, starting...")
+        source_conf = self._config["source"]
+        if not isinstance(source_conf, Mapping):
+            source_conf = {"path": source_conf}
+        source_conf["user_name"] = self._config["command"]["user"]
+        target_conf = self._config["target"]
+        if not isinstance(target_conf, Mapping):
+            target_conf = {"path": target_conf}
+        target_conf["user_name"] = self._config["command"]["user"]
+        try:
+            self._do_pre_backup()
+            with unlock(source_conf) as source, unlock(target_conf) as target:
+                self._do_backup(source, target)
+                self._did_backup(successful=True)
+        except RuntimeError:
+            self.log(f"Backup job {self.name} failed", level=logging.ERROR)
+            self._did_backup(successful=False)
+        except ValueError:
+            self.log(f"Could not reach source or target path for job {self.name}",
+                     level=logging.ERROR)
+            self._did_backup(successful=False)
+
+    def _do_pre_backup(self):
+        pre_commands = self._config.get("pre-commands", [])
+        if pre_commands:
+            self.log("Executing pre-commands:")
+        for pre_command in pre_commands:
+            pre_command = f"bash -c {shlex.quote(pre_command)}"
+            _, _, ret = run(pre_command, user_name=self._config["command"]["user"], log=self.log)
+            if ret != 0:
+                self.log_raise(RuntimeError, "Error executing a pre-command")
+
+    def _do_backup(self, source, target):
+        raise NotImplementedError
+
+    def _did_backup(self, successful):
+        if self._config["command"].get("dry-run", False):
+            self.log("Backup was a dry run")
+            successful = False
+        elif successful:
+            self.log("Backup was successful")
+            self._info["last_success_time"] = datetime.now().timestamp()
+        else:
+            self.log("Backup was not successful")
+        self._info["last_result"] = successful
+        self._info["is_due"] = self.due and not successful
+        self._save_info()
+
+    def mount(self):
+        target_conf = self._config["target"]
+        if not isinstance(target_conf, Mapping):
+            target_conf = {"path": target_conf}
+        target_conf["user_name"] = self._config["command"]["user"]
+        mountpoint = Path(self._config["command"].get("mountpoint", "/tmp/")) / self.name
+        if mountpoint.exists():
+            self.log_raise(RuntimeError, f"Mount point {mountpoint} already exists")
+        mountpoint.mkdir()
+        with unlock(target_conf) as target:
+            try:
+                self.log(f"Mounting {self.name} at {mountpoint}. Press Ctrl+C to unmount.")
+                self._do_mount(target, mountpoint)
+                while True:
+                    pass
+            except KeyboardInterrupt:
+                self._do_unmount(mountpoint)
+                self.log(f"Unmounted {self.name} from {mountpoint}.")
+        mountpoint.rmdir()
+
+    def _do_mount(self, target, mountpoint):
+        raise NotImplementedError
+
+    def _do_unmount(self, mountpoint):
+        raise NotImplementedError
+
+    def log(self, msg, level=logging.INFO):
+        self._logger.log(level, msg)
+
+    def log_raise(self, exc, msg):
+        self._logger.debug(msg)
+        raise exc(msg)
+
+    def show_log(self, log_number=None, follow=False):
+        logfile = Path(self._config["log"]["path"])  / f"{self.name}.log"
+        if log_number:
+            logfile += f".{log_number}"
+        run_less(logfile, follow=follow)
+
+    def _init_logger(self):
+        logfile = Path(self._config["log"]["path"]) / f"{self.name}.log"
+        handler = GroupWriteRotatingFileHandler(logfile, maxBytes=30*1024*1024, backupCount=9)
+        formatter = logging.Formatter("%(message)s")
+        handler.setFormatter(formatter)
+        handler.setLevel(logging.INFO)
+        logger = logging.getLogger(f"{__appname__}.{self.name}")
+        logger.setLevel(logging.DEBUG)
+        logger.addHandler(handler)
+        self._logger = logger
+        self._rotate_log = handler.doRollover
+
+    def _init_info(self):
+        logpath = Path(self._config["log"]["path"])
+        try:
+            with open(logpath / f"{self.name}.yaml", "r") as fp:
+                self._info = dict(yaml.safe_load(fp))
+        except (FileNotFoundError, ValueError):
+            self._info = {}
+        self._info = dict(self._default_info, **self._info)
+
+    def _save_info(self):
+        logpath = Path(self._config["log"]["path"])
+        with open(logpath / f"{self.name}.yaml", "w+") as fp:
+            yaml.dump(self._info, fp)
+
+    @property
+    def date(self):
+        return datetime.fromtimestamp(self._info["last_success_time"]).replace(microsecond=0)
+
+    @property
+    def age(self):
+        td = datetime.now() - self.date
+        td = timedelta(days=td.days, seconds=td.seconds)    # forget microseconds
+        return td
+
+    @property
+    def interval(self):
+        if self._config["command"]["interval"] is None:
+            return timedelta.max
+        td = timedelta(**self._config["command"]["interval"])
+        td = timedelta(days=td.days, seconds=td.seconds)    # forget microseconds
+        return td
+
+    @property
+    def todo(self):
+        return self._info["is_due"]
+    @todo.setter
+    def todo(self, value):
+        self._info["is_due"] = value
+        self._save_info()
+
+    @property
+    def due(self):
+        return self.age > self.interval or self.todo
+
+
+
+class BorgJob(Job):
+    command_config_requires = ("borg-keyfile", "borg-prune")
+    def _do_backup(self, source, target):
+        assert isinstance(target, str)
+        if not isinstance(source, str) and isinstance(source, Iterable):
+            source = " ".join(source)
+        keyfile = self._config["command"]["borg-keyfile"]
+        user_name = self._config["command"]["user"]
+        # env = {"BORG_PASSCOMMAND": f"cat {keyfile}"}
+        _, key, _ = run(f"cat {keyfile}", user_name="root")
+        env = {"BORG_PASSPHRASE": key.strip()}
+
+        command = self._create_command(source, target)
+        _, _, ret = run(command, user_name=user_name, log=self.log, **env)
+        if ret != 0:
+            self.log_raise(RuntimeError, "Borg failed")
+
+        command = self._prune_command(target)
+        _, _, ret = run(command, user_name=user_name, log=self.log, **env)
+        if ret != 0:
+            self.log_raise(RuntimeError, "Borg pruning failed (backup was successful before)")
+
+        command = f"/usr/local/bin/borg list {target}"
+        run(command, user_name=user_name, log=self.log, **env)
+
+    def _create_command(self, source, target):
+        filter_ = self._config["command"]["borg-log-filter"]
+        flags = f" -x --noatime --info --list --filter={filter_} "
+        if self._config["command"].get("dry-run", False):
+            flags += " --dry-run"
+        else:
+            flags += " --stats "
+        exclude = ""
+        for entry in self._config.get("exclude", []):
+            exclude += f" --exclude '{entry}' "
+
+        archive_name = self.name + "-{now:%Y-%m-%dT%H:%M:%S}"
+        command = (
+            f"/usr/local/bin/borg create {flags} "
+            f"'{target}'::'{archive_name}' {source} "
+            f"{exclude}"
+        )
+        return command
+
+    def _prune_command(self, target):
+        keeptypes = ("keep-hourly", "keep-daily", "keep-weekly",
+                     "keep-monthly", "keep-yearly")
+        flags = f" -v --list --prefix {self.name} "
+        if self._config["command"].get("dry-run", False):
+            flags += " --dry-run "
+        keep = ""
+        for keeptype, keepvalue in self._config["command"]["borg-prune"].items():
+            if keeptype in keeptypes:
+                keep += f" --{keeptype}={keepvalue} "
+        command = (
+            f"/usr/local/bin/borg prune {target} {flags} "
+            f"{keep}"
+        )
+        return command
+
+    def _do_mount(self, target, mountpoint):
+        assert isinstance(target, str)
+        keyfile = self._config["command"]["borg-keyfile"]
+        # env = {"BORG_PASSCOMMAND": f"cat {keyfile}"}
+        _, key, _ = run(f"cat {keyfile}", user_name="root")
+        env = {"BORG_PASSPHRASE": key.strip()}
+
+        _, _, ret = run(f"/usr/local/bin/borg mount {target} {mountpoint}", log=self.log, **env)
+        if ret != 0:
+            self.log_raise(RuntimeError, "Mounting failed")
+
+    def _do_unmount(self, mountpoint):
+        _, _, ret = run(f"/usr/local/bin/borg umount {mountpoint}", log=self.log)
+        if ret != 0:
+            self.log_raise(RuntimeError, "Unmounting failed")
+
+
+class RSyncJob(Job):
+    def _do_backup(self, source, target):
+        assert isinstance(target, str)
+        user_name = self._config["command"]["user"]
+
+        commands = self._rsync_commands(source, target)
+        for command in commands:
+            _, _, ret = run(command, user_name=user_name, log=self.log)
+            if ret != 0:
+                self.log_raise(RuntimeError, "RSync failed")
+
+    def _rsync_commands(self, source, target):
+        flags = " -auvhz "
+        if self._config["command"].get("rsync-delete", False):
+            flags += " --delete "
+        if self._config["command"].get("dry-run", False):
+            flags += " -n "
+        exclude = ""
+        for entry in self._config.get("exclude", []):
+            exclude += f" --exclude='{entry}' "
+
+        if self._config["command"].get("rsync-map", False):
+            for s, t in self._config["command"]["rsync-map"].items():
+                yield f"/usr/bin/rsync {flags} {exclude} {source}{s} {target}{t}"
+        elif isinstance(source, str):
+            yield f"/usr/bin/rsync {flags} {exclude} {source} {target}"
+        elif isinstance(source, Iterable):
+            for s in source:
+                yield f"/usr/bin/rsync {flags} {exclude} {s} {target}"
+        else:
+            self.log_raise(ValueError, f"invalid source value {source}")
+
+    def _do_mount(self, target, mountpoint):
+        self.log_raise(RuntimeError, "Mounting is only implemented for borg jobs")
+
+    def _do_unmount(self, mountpoint):
+        self.log_raise(RuntimeError, "Mounting is only implemented for borg jobs")
+
+
+class unlock:              # pylint: disable=too-few-public-methods
+    _requires = {
+        "luks": ("luks-device", "luks-keyfile", "luks-label"),
+        "ssh": ("ssh-host", ),
+        "fstab": ("fstab-entry", ),
+        None: tuple()
+    }
+    def __init__(self, loc_conf):
+        self.log = main_log
+        self.log_raise = main_log_raise
+        if isinstance(loc_conf, Mapping):
+            self.path = loc_conf.pop("path")
+            for method, kws in self._requires.items():
+                if all(k in loc_conf for k in kws):
+                    self.method = method
+                    self.kwargs = loc_conf
+                    break
+            else:
+                self.log_raise(TypeError, f"unlock: invalid argument {loc_conf}")
+        elif isinstance(loc_conf, Iterable):      # str is also an Iterable
+            self.method = None
+            self.path = loc_conf
+            self.kwargs = {}
+        else:
+            self.log_raise(ValueError, f"invalid loc_conf: '{loc_conf}'")
+        self.user = self.kwargs.get("user_name", None)
+        self._closers = []
+
+    def __enter__(self):
+        path = self.path
+        if self.method is None:
+            pass
+        elif self.method == "luks":
+            device = self.kwargs["luks-device"]
+            keyfile = self.kwargs["luks-keyfile"]
+            mapped_device = f"/dev/disk/by-label/{self.kwargs['luks-label']}"
+            self._unlock_luks(device, keyfile, mapped_device)
+        elif self.method == "fstab":
+            mountpoint = self.kwargs["fstab-entry"]
+            self._unlock_fstab(mountpoint)
+        elif self.method == "ssh":
+            host = self.kwargs["ssh-host"]
+            self._unlock_ssh(host)
+            path = f"-e ssh {host}:{self.path}"
+        else:
+            self.log_raise(ValueError, f"Unknown unlocking method {self.method}")
+        return path
+
+    def __exit__(self, type_, value, tb):
+        for closer in self._closers:
+            closer()
+
+    def _unlock_luks(self, device, keyfile, mapped_device):
+        """Create keyfile before with echo -n password > keyfile."""
+        _, out, _ = run(f"udisksctl info -b {device}", user_name=self.user)
+        if "crypto_LUKS" not in out:
+            self.log_raise(ValueError, f"'{device}' is no LUKS partition.")
+
+        # Check if already available
+        _, out, _ = run("mount -l")
+        if self.path in out:
+            self.log(f"{self.path} already mounted")
+            return
+
+        # Unlock
+        _, key, _ = run(f"cat {keyfile}", user_name="root")
+        _, _, ret = run(f"bash 'udisksctl unlock -b {device} --key-file <(echo -n '{key}')'",
+                        user_name=self.user)
+        if ret != 0:
+            self.log(f"Can't unlock {device}.", logging.ERROR)
+        else:
+            def relock_luks():
+                _, _, ret = run(f"udisksctl lock -b {device}", user_name=self.user)
+                if ret != 0:
+                    self.log(f"Could not lock {device} again.", logging.ERROR)
+            self._closers.append(relock_luks)
+
+        # Mount
+        _, _, ret = run(f"udisksctl mount -b {mapped_device}", user_name=self.user)
+        if ret != 0:
+            self.log_raise(ValueError, f"Can't mount '{device}' (mapped to '{mapped_device}').")
+        def unmount_luks():
+            _, _, ret = run(f"udisksctl unmount --force -b {mapped_device}", user_name=self.user)
+            if ret != 0:
+                self.log(f"Could not unmount {device} again.", logging.ERROR)
+        self._closers.insert(0, unmount_luks)
+
+    def _unlock_fstab(self, mountpoint):
+        with open("/etc/fstab", "r") as ftf:
+            fstab = ftf.read()
+        if mountpoint not in fstab:
+            self.log_raise(ValueError, f"'{self.path}' is not in /etc/fstab.")
+
+        # Check if already available
+        _, out, _ = run("mount -l", user_name=self.user)
+        if self.path in out:
+            self.log(f"{self.path} already mounted")
+            return
+
+        _, _, ret = run(f"timeout 10 mount {mountpoint}", user_name=self.user)
+        if ret != 0:
+            self.log_raise(ValueError, f"Can't mount '{mountpoint}'.")
+        def unmount_fstab():
+            _, _, ret = run(f"umount {mountpoint}", user_name=self.user)
+            if ret != 0:
+                self.log(f"Could not unmount {mountpoint} again.", logging.ERROR)
+        self._closers.append(unmount_fstab)
+
+    def _unlock_ssh(self, host):
+        _, _, ret = run(f"timeout 10 ssh {host} '[ -d {self.path} ]'", user_name=self.user)
+        if ret != 0:
+            self.log_raise(ValueError, f"Can't reach host '{host}'")
+
+
+def am_i_root():
+    _, out, _ = run("id -u")
+    return out == "0"
+
+def run(command, user_name=None, log=None, **kwargs):
+    """ https://janakiev.com/blog/python-shell-commands/ """
+    blue = "\033[94m"
+    endcolor = "\033[0m"
+    if log is None:
+        log = lambda _: None
+        main_log(f"Running '{blue}{command.strip()}{endcolor}' as '{user_name}'", logging.DEBUG)
+    log(f"Running '{blue}{command.strip()}{endcolor}' as '{user_name}'")
+    # https://stackoverflow.com/questions/1770209/
+    # run-child-processes-as-different-user-from-a-long-running-python-process
+    env = os.environ.copy()
+    if user_name is not None:
+        pw_record = pwd.getpwnam(user_name)
+        env["HOME"] = pw_record.pw_dir
+        env["LOGNAME"] = pw_record.pw_name
+        env["USER"] = pw_record.pw_name
+        def demote():
+            os.setgid(pw_record.pw_gid)
+            os.setuid(pw_record.pw_uid)
+    else:
+        demote = lambda *_: None
+    for key, value in kwargs.items():
+        env[key] = value
+
+    process = subprocess.Popen(
+        shlex.split(command),
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True,
+        preexec_fn=demote, env=env
+    )
+    return _surveil_process(process, log)
+
+def _surveil_process(process, log):
+    # https://stackoverflow.com/questions/2996887/
+    # how-to-replicate-tee-behavior-in-python-when-using-subprocess
+    outstring = ""
+    while process.poll() is None:
+        line = process.stdout.readline()
+        if line.strip():
+            log(line.strip())
+            outstring += line
+    rest = process.stdout.read()
+    if rest.strip():
+        log(rest.strip())
+        outstring += rest
+    return process, outstring, process.returncode
+
+def run_less(fname, follow=False):
+    if follow:
+        f_arg = "+F"  # -S turns off wrapping
+    else:
+        f_arg = "-F +G"
+    command = f"less {f_arg} -R -X -K {fname}"
+    try:
+        process = subprocess.Popen(shlex.split(command), stdout=sys.stdout)
+        process.wait()
+    except KeyboardInterrupt:
+        # handled by less
+        pass
+
+
+def get_lock(process_name):
+    """https://stackoverflow.com/questions/788411/check-to-see-if-python-script-is-running"""
+    get_lock.lock_socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    try:
+        get_lock.lock_socket.bind("\0" + process_name)
+        return True
+    except socket.error:
+        return False
+
+if __name__ == "__main__":
+    if get_lock(__appname__):
+        retval = main()
+    else:
+        retval = main(already_running=True)
+    sys.exit(retval)

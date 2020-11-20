@@ -1,0 +1,116 @@
+# change to your liking
+# the "default" entry provides fallback values for every other entry
+# warning: when using interval or borg-prune in "default", all fields are separate fallbacks
+#          and thus must all be overwritten in the other entries
+
+# example:
+#   pre-commands:
+#     - echo bla > /tmp/test.txt
+#     - >
+#       echo "longer command
+#       going over multiple lines" > /tmp/test2.txt
+#   command:
+#     command: borg   # or rsync
+#     user: null      # null will fall back to the user executing beckapp.py
+#     interval: { weeks: 1, days: 1 }
+#     borg-keyfile: /invalid/path        # important
+#     borg-prune: { keep-daily: 7, keep-weekly: 4, keep-monthly: 6, keep-yearly: 10 }
+#     borg-log-filter: AME
+#     borg-mountpoint: /tmp   # where to mount borg repos fore restoring
+#     rsync-delete: False     # defaults to False
+#     dry-run: False          # defaults to False
+#   source:
+#     path: /invalid/path
+#     luks-device: /invalid/dev/sdaX
+#     luks-keyfile: /invalid/path.phrase
+#     luks-label: luks-label
+#     ssh-host: user@server.invalid
+#     fstab-entry: /invalid/mnt/exmpl
+#   target: /invalid/path               # same args as source
+#   exclude:                            # list of exclusion patterns
+#     - "*invalid"                      # quote asterisks
+#     - /tmp                            # relative or absolute depends on rsync or borg
+#     - "*/venv"
+
+
+default:
+  log:
+    path: /home/user/.backup/logs
+  command:
+    borg-prune: { keep-daily: 7, keep-weekly: 4, keep-monthly: 6, keep-yearly: 10 }
+    borg-log-filter: AME
+    borg-mountpoint: /tmp
+
+
+home:
+  pre-commands:
+    - >       # this makes a list of all installed packages
+      comm -23
+      <(apt-mark showmanual | sort -u)
+      <(gzip -dc /var/log/installer/initial-status.gz
+      | sed -n 's/^Package: //p' | sort -u)
+      > /home/user/.backup/installed-packages.txt
+  command:
+    command: borg
+    borg-keyfile: /path/to/keyfile
+    interval: { days: 1 }
+    user: user
+  source: /home
+  target:
+    path: /mnt/backup/backup_home
+    fstab-entry: /mnt/backup
+  exclude:
+    - /home/user/Downloads
+    - /home/user/snap
+    - /home/user/.config/borg
+    - /home/*/.cache
+    - /home/*/.gvfs
+    - /home/*/.local/lib
+    - /home/*/.local/share/Trash
+    - "*/venv"
+    - "*/lost+found"
+
+
+media:
+  command:
+    command: rsync
+    interval: { days: 1 }
+    user: user
+  source: [/home/user/Videos, /home/user/Music, /home/user/Pictures]
+  target:
+    path: /mnt/media
+    fstab-entry: /mnt/media
+
+
+projects:
+  command:
+    command: rsync
+    interval: { days: 7 }
+    user: user
+    rsync-map:
+      project1/: foobar/
+      # contents of /home/user/projects/project1/* goes to user@server.com:/data/foobar/*
+      project2: foobar/
+      # /home/user/projects/project2 goes to user@server.com:/data/foobar/ as a whole folder
+  source: /home/user/projects/
+  target:
+    path: /data/
+    ssh-host: user@server.com
+
+
+external_system:
+  command:
+    command: borg
+    borg-keyfile: /path/to/keyfile
+    interval: null
+    user: root
+  source: [/etc, /var, /usr/local]
+  target: /media/user/USB_HDD
+  exclude:
+    - /var/lib
+    - /var/snap
+    - /var/spool
+    - "*/tmp"
+    - "*/cache"
+    - "*/venv"
+    - "*/lost+found"
