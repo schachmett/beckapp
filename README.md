@@ -1,7 +1,7 @@
  
 # Beckapp
 
-"Simple" backup script that utilizes [Borg Backup](https://borgbackup.readthedocs.io) and [rsync](https://linux.die.net/man/1/rsync) to put files away safely. Key points:
+"Simple" backup script that utilizes the great [Borg Backup](https://borgbackup.readthedocs.io) and [rsync](https://linux.die.net/man/1/rsync) to put files away safely. Key points:
 
 * Configurable with a [yaml](https://yaml.org/)-file
 * Runs every 30 min or so to check if a backup is due
@@ -9,6 +9,7 @@
 	- network shares can be defined in the [fstab](https://wiki.archlinux.de/title/Fstab)
 	- LUKS encrypted partitions are mounted automatically
 	- ssh access is tested for rsync, might not work for borg (yet, but should be easy to implement)
+* Runs as a specified user
 
 ## Installation
 
