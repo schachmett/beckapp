@@ -600,10 +600,10 @@ class unlock:              # pylint: disable=too-few-public-methods
         # Unlock
         _, key, _ = run(f"cat {keyfile}", user_name="root")
         nolog = lambda _: None
-        _, _, ret = run(f"bash 'udisksctl unlock -b {device} --key-file <(echo -n '{key}')'",
+        _, _, ret = run(f"bash -c 'udisksctl unlock -b {device} --key-file <(echo -n '{key}')'",
                         user_name=self.user, log=nolog)
-        main_log(f"Running '\033[94mbash 'udisksctl unlock -b {device} "
-                 f"--key-file <(echo -n ***)\033[0m' as '{self.user}'")
+        main_log(f"Running '\033[94mbash -c 'udisksctl unlock -b {device} "
+                 "--key-file <(echo -n ***)'\033[0m as '{self.user}'")
         if ret != 0:
             self.log(f"Can't unlock {device}.", logging.ERROR)
         else:
