@@ -322,13 +322,16 @@ class Job:
 
     def mount(self):
         target_conf = self._config["target"]
+        user_name = self._config["command"]["user"]
         if not isinstance(target_conf, Mapping):
             target_conf = {"path": target_conf}
-        target_conf["user_name"] = self._config["command"]["user"]
+        target_conf["user_name"] = user_name
         mountpoint = Path(self._config["command"].get("mountpoint", "/tmp/")) / self.name
-        if mountpoint.exists():
+        if mountpoint.exists() and any(mountpoint.iterdir()):
             self.log_raise(RuntimeError, f"Mount point {mountpoint} already exists")
-        mountpoint.mkdir()
+        print(user_name)
+        run(f"mkdir -p {str(mountpoint)}", user_name=user_name, log=self.log)
+        # mountpoint.mkdir()
         with unlock(target_conf) as target:
             try:
                 self.log(f"Mounting {self.name} at {mountpoint}. Press Ctrl+C to unmount.")
@@ -480,16 +483,19 @@ class BorgJob(Job):
     def _do_mount(self, target, mountpoint):
         assert isinstance(target, str)
         keyfile = self._config["command"]["borg-keyfile"]
-        # env = {"BORG_PASSCOMMAND": f"cat {keyfile}"}
+        user_name = self._config["command"]["user"]
         _, key, _ = run(f"cat {keyfile}", user_name="root")
         env = {"BORG_PASSPHRASE": key.strip()}
 
-        _, _, ret = run(f"/usr/local/bin/borg mount {target} {mountpoint}", log=self.log, **env)
+        _, _, ret = run(f"/usr/local/bin/borg mount {target} {mountpoint}",
+                        user_name=user_name, log=self.log, **env)
         if ret != 0:
             self.log_raise(RuntimeError, "Mounting failed")
 
     def _do_unmount(self, mountpoint):
-        _, _, ret = run(f"/usr/local/bin/borg umount {mountpoint}", log=self.log)
+        user_name = self._config["command"]["user"]
+        _, _, ret = run(f"/usr/local/bin/borg umount {mountpoint}",
+                        user_name=user_name, log=self.log)
         if ret != 0:
             self.log_raise(RuntimeError, "Unmounting failed")
 
@@ -667,12 +673,15 @@ def run(command, user_name=None, log=None, **kwargs):
     env = os.environ.copy()
     if user_name is not None:
         pw_record = pwd.getpwnam(user_name)
-        env["HOME"] = pw_record.pw_dir
-        env["LOGNAME"] = pw_record.pw_name
-        env["USER"] = pw_record.pw_name
-        def demote():
-            os.setgid(pw_record.pw_gid)
-            os.setuid(pw_record.pw_uid)
+        if pw_record.pw_uid == os.getuid():
+            demote = lambda *_: None
+        else:
+            env["HOME"] = pw_record.pw_dir
+            env["LOGNAME"] = pw_record.pw_name
+            env["USER"] = pw_record.pw_name
+            def demote():
+                os.setgid(pw_record.pw_gid)
+                os.setuid(pw_record.pw_uid)
     else:
         demote = lambda *_: None
     for key, value in kwargs.items():
