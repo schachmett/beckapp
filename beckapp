@@ -639,7 +639,7 @@ class unlock:              # pylint: disable=too-few-public-methods
             self.log_raise(ValueError, f"'{mountpoint}' is not in /etc/fstab.")
 
         # Check if already available
-        _, out, _ = run(f"df {mountpoint}", user_name=self.user, log=print)
+        _, out, _ = run(f"df {mountpoint}", user_name=self.user)
         if mountpoint in out:
             self.log(f"{mountpoint} already mounted")
             return
