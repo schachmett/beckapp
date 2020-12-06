@@ -329,10 +329,9 @@ class Job:
         if not isinstance(target_conf, Mapping):
             target_conf = {"path": target_conf}
         target_conf["user_name"] = user_name
-        mountpoint = Path(self._config["command"].get("mountpoint", "/tmp/")) / self.name
+        mountpoint = Path(self._config["command"].get("borg-mountpoint", "/tmp/")) / self.name
         if mountpoint.exists() and any(mountpoint.iterdir()):
             self.log_raise(RuntimeError, f"Mount point {mountpoint} already exists")
-        print(user_name)
         run(f"mkdir -p {str(mountpoint)}", user_name=user_name, log=self.log)
         # mountpoint.mkdir()
         with unlock(target_conf) as target:
