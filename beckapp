@@ -26,7 +26,7 @@ __appname__ = "beckapp"
 CONFIG = Path("/usr/local/etc/backup/backup.yaml")
 
 
-def main(already_running=False):
+def main():
     err_code = 0
     defaults, config = load_config(CONFIG)
     params = parse_args()
@@ -50,15 +50,14 @@ def main(already_running=False):
             main_log(f"Found no config for job '{job_name}', skipping that...", logging.ERROR)
             err_code = 1
 
-    ex = Executor(params, jobs, already_running=already_running)
+    ex = Executor(params, jobs)
     return ex(params.command[0]) + err_code
 
 
 class Executor:
-    def __init__(self, params, jobs, already_running=False):
+    def __init__(self, params, jobs):
         self.jobs = jobs
         self.params = params
-        self.already_running = already_running
 
     def __call__(self, command):
         commands = {
@@ -72,7 +71,7 @@ class Executor:
         return commands[command]()
 
     def backup(self):
-        if self.already_running:
+        if not get_lock(f"{__appname__}-critical"):
             main_log("Stopping: Backup already in progress", logging.CRITICAL)
             return 2
         for job in self.jobs:
@@ -85,6 +84,9 @@ class Executor:
         return 0
 
     def mount(self):
+        if not get_lock(f"{__appname__}-critical"):
+            main_log("Stopping: Backup in progress", logging.CRITICAL)
+            return 2
         if len(self.jobs) != 1:
             main_log("Mount needs exactly 1 'job' argument", logging.CRITICAL)
             return 2
@@ -138,8 +140,9 @@ class Executor:
                      f"{blue}{str(job.age):>20s}{endcolor}"
                      f"{color}{due:>20s}{endcolor}")
         main_log("-" * 60)
-        if self.already_running:
-            main_log(f"\033[91m{'A backup is running at the moment!':^60s}{endcolor}")
+
+        if not get_lock(f"{__appname__}-critical"):
+            main_log(f"\033[91m{'A backup is running or is mounted now!':^60s}{endcolor}")
             main_log("-" * 60)
         return 0
 
@@ -633,12 +636,12 @@ class unlock:              # pylint: disable=too-few-public-methods
         with open("/etc/fstab", "r") as ftf:
             fstab = ftf.read()
         if mountpoint not in fstab:
-            self.log_raise(ValueError, f"'{self.path}' is not in /etc/fstab.")
+            self.log_raise(ValueError, f"'{mountpoint}' is not in /etc/fstab.")
 
         # Check if already available
-        _, out, _ = run("mount -l", user_name=self.user)
-        if self.path in out:
-            self.log(f"{self.path} already mounted")
+        _, out, _ = run(f"df {mountpoint}", user_name=self.user, log=print)
+        if mountpoint in out:
+            self.log(f"{mountpoint} already mounted")
             return
 
         _, _, ret = run(f"timeout 10 mount {mountpoint}", user_name=self.user)
@@ -733,8 +736,5 @@ def get_lock(process_name):
         return False
 
 if __name__ == "__main__":
-    if get_lock(__appname__):
-        retval = main()
-    else:
-        retval = main(already_running=True)
+    retval = main()
     sys.exit(retval)
