@@ -496,7 +496,7 @@ class BorgJob(Job):
 
     def _do_unmount(self, mountpoint):
         user_name = self._config["command"]["user"]
-        _, _, ret = run(f"/usr/local/bin/borg umount {mountpoint}",
+        _, _, ret = run(f"/bin/fusermount -zu {mountpoint}",
                         user_name=user_name, log=self.log)
         if ret != 0:
             self.log_raise(RuntimeError, "Unmounting failed")
@@ -668,8 +668,9 @@ def run(command, user_name=None, log=None, **kwargs):
     endcolor = "\033[0m"
     if log is None:
         log = lambda _: None
-        main_log(f"Running '{blue}{command.strip()}{endcolor}' as '{user_name}'", logging.DEBUG)
-    log(f"Running '{blue}{command.strip()}{endcolor}' as '{user_name}'")
+        main_log(f"Running '{blue}{' '.join(shlex.split(command))}{endcolor}' as '{user_name}'", 
+                 logging.DEBUG)
+    log(f"Running '{blue}{' '.join(shlex.split(command))}{endcolor}' as '{user_name}'")
     # https://stackoverflow.com/questions/1770209/
     # run-child-processes-as-different-user-from-a-long-running-python-process
     env = os.environ.copy()
@@ -688,12 +689,14 @@ def run(command, user_name=None, log=None, **kwargs):
         demote = lambda *_: None
     for key, value in kwargs.items():
         env[key] = value
-
-    process = subprocess.Popen(
-        shlex.split(command),
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True,
-        preexec_fn=demote, env=env
-    )
+    try:
+        process = subprocess.Popen(
+            shlex.split(command),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True,
+            preexec_fn=demote, env=env
+        )
+    except subprocess.SubprocessError as e:
+        raise RuntimeError(f"Could not get the user permissions for user {user_name}")
     return _surveil_process(process, log)
 
 def _surveil_process(process, log):
