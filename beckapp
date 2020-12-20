@@ -298,6 +298,8 @@ class Job:
             self._did_backup(successful=False)
 
     def _do_pre_backup(self):
+        notify_user = self._config["log"].get("notify-user", None)
+        notify(f"starting \"{self.name}\" backup...", user_name=notify_user, log=self.log)
         pre_commands = self._config.get("pre-commands", [])
         if pre_commands:
             self.log("Executing pre-commands:")
@@ -311,14 +313,18 @@ class Job:
         raise NotImplementedError
 
     def _did_backup(self, successful):
+        notify_user = self._config["log"].get("notify-user", None)
         if self._config["command"].get("dry-run", False):
             self.log("Backup was a dry run")
             successful = False
+            return
         elif successful:
             self.log("Backup was successful")
+            notify(f"\"{self.name}\" backup was successful", user_name=notify_user, log=self.log)
             self._info["last_success_time"] = datetime.now().timestamp()
         else:
             self.log("Backup was not successful")
+            notify(f"\"{self.name}\" backup failed", user_name=notify_user, log=self.log)
         self._info["last_result"] = successful
         self._info["is_due"] = self.due and not successful
         self._save_info()
@@ -662,14 +668,23 @@ def am_i_root():
     _, out, _ = run("id -u")
     return out == "0"
 
+def notify(message, user_name, log=None):
+    """https://stackoverflow.com/questions/54640352"""
+    pw_record = pwd.getpwnam(user_name)
+    uid = pw_record.pw_uid
+    dbus_address = f"unix:path=/run/user/{uid}/bus"
+    run(f"notify-send Beckapp '{message}'",
+        user_name=user_name, log=log, DBUS_SESSION_BUS_ADDRESS=dbus_address)
+
+
 def run(command, user_name=None, log=None, **kwargs):
     """ https://janakiev.com/blog/python-shell-commands/ """
     blue = "\033[94m"
     endcolor = "\033[0m"
     if log is None:
         log = lambda _: None
-        main_log(f"Running '{blue}{' '.join(shlex.split(command))}{endcolor}' as '{user_name}'", 
-                 logging.DEBUG)
+        main_log(f"Running '{blue}{' '.join(shlex.split(command)).strip()}{endcolor}' as "
+                 "'{user_name}'", logging.DEBUG)
     log(f"Running '{blue}{' '.join(shlex.split(command))}{endcolor}' as '{user_name}'")
     # https://stackoverflow.com/questions/1770209/
     # run-child-processes-as-different-user-from-a-long-running-python-process
@@ -695,7 +710,7 @@ def run(command, user_name=None, log=None, **kwargs):
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True,
             preexec_fn=demote, env=env
         )
-    except subprocess.SubprocessError as e:
+    except subprocess.SubprocessError as _:
         raise RuntimeError(f"Could not get the user permissions for user {user_name}")
     return _surveil_process(process, log)
 
