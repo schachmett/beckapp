@@ -675,7 +675,7 @@ def notify(message, user_name, log=None):
     pw_record = pwd.getpwnam(user_name)
     uid = pw_record.pw_uid
     dbus_address = f"unix:path=/run/user/{uid}/bus"
-    run(f"notify-send Beckapp '{message}'",
+    run(f"notify-send Beckapp '{message}' --hint int:transient:1",
         user_name=user_name, log=log, DBUS_SESSION_BUS_ADDRESS=dbus_address)
 
 
