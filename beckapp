@@ -515,7 +515,8 @@ class RSyncJob(Job):
 
         commands = self._rsync_commands(source, target)
         for command in commands:
-            _, _, ret = run(command, user_name=user_name, log=self.log)
+            _, _, ret = run(command, user_name=user_name,
+                            log=self.log, SSH_AUTH_SOCK="/run/user/1000/keyring/ssh")
             if ret != 0:
                 self.log_raise(RuntimeError, "RSync failed")
 
@@ -659,7 +660,8 @@ class unlock:              # pylint: disable=too-few-public-methods
         self._closers.append(unmount_fstab)
 
     def _unlock_ssh(self, host):
-        _, _, ret = run(f"timeout 10 ssh {host} '[ -d {self.path} ]'", user_name=self.user)
+        _, _, ret = run(f"timeout 10 ssh {host} '[ -d {self.path} ]'",
+                        user_name=self.user, SSH_AUTH_SOCK="/run/user/1000/keyring/ssh")
         if ret != 0:
             self.log_raise(ValueError, f"Can't reach host '{host}'")
 
@@ -684,7 +686,7 @@ def run(command, user_name=None, log=None, **kwargs):
     if log is None:
         log = lambda _: None
         main_log(f"Running '{blue}{' '.join(shlex.split(command)).strip()}{endcolor}' as "
-                 "'{user_name}'", logging.DEBUG)
+                 f"'{user_name}'", logging.DEBUG)
     log(f"Running '{blue}{' '.join(shlex.split(command))}{endcolor}' as '{user_name}'")
     # https://stackoverflow.com/questions/1770209/
     # run-child-processes-as-different-user-from-a-long-running-python-process
