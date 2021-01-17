@@ -4,6 +4,7 @@ beckapp automates rsync and borg backup jobs.
 """
 # pylint: disable=invalid-name
 # pylint: disable=missing-docstring
+# pylint: disable=logging-format-interpolation
 
 import sys
 import socket
@@ -71,6 +72,15 @@ class Executor:
         return commands[command]()
 
     def backup(self):
+        for job in self.jobs:
+            if job.due:
+                break
+        else:
+            main_log("No backup is due")
+            return 0
+        if not get_AC_connected() or self.params.force_backup:
+            main_log("Stopping: AC not connected")
+            return 1
         if not get_lock(f"{__appname__}-critical"):
             main_log("Stopping: Backup already in progress", logging.CRITICAL)
             return 2
@@ -148,6 +158,7 @@ class Executor:
 
     @staticmethod
     def debug():
+        # pylint: disable=import-outside-toplevel
         import time
         time.sleep(20)
         return 0
@@ -707,6 +718,7 @@ def run(command, user_name=None, log=None, **kwargs):
     for key, value in kwargs.items():
         env[key] = value
     try:
+        # pylint: disable=subprocess-popen-preexec-fn
         process = subprocess.Popen(
             shlex.split(command),
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True,
@@ -753,6 +765,19 @@ def get_lock(process_name):
         return True
     except socket.error:
         return False
+
+def get_AC_connected():
+    """https://stackoverflow.com/questions/16699883/"""
+    try:
+        with open("/sys/class/power_supply/AC0/online", "r") as acf:
+            connected = "1" in acf.readline()
+    except FileNotFoundError:
+        try:
+            with open("/sys/class/power_supply/BAT0/status", "r") as batf:
+                connected = "Charging" in batf.readline()
+        except FileNotFoundError:
+            connected = True    # assume that AC is connected
+    return connected
 
 if __name__ == "__main__":
     retval = main()
