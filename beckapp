@@ -73,7 +73,7 @@ class Executor:
 
     def backup(self):
         for job in self.jobs:
-            if job.due:
+            if job.due or self.params.force_backup:
                 break
         else:
             main_log("No backup is due")
