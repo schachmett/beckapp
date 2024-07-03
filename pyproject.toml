@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=42", "wheel", "setuptools_scm[toml]>=3.4"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools_scm]
+
+[tool.black]
+line-length = 100
+
+[tool.isort]
+line_length = 100
+profile = "black"
+
+[tool.pylint."MESSAGES CONTROL"]
+max-line-length = 100
+disable = [
+    "logging-fstring-interpolation",
+    "missing-docstring",
+    "multiple-statements" # managed by black
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "strict"
+addopts = "--log-level DEBUG"
+testpaths = ["tests"]
+
+[[tool.mypy.overrides]]
+ignore_missing_imports = true
+
+[tool.mypy]
+check_untyped_defs = true
